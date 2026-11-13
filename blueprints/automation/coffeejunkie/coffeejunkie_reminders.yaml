@@ -1,0 +1,188 @@
+blueprint:
+  name: "Coffeejunkie: maintenance and bean reminders"
+  description: >-
+    Quiet phone notification when a maintenance of the coffeejunkie package is due (backflush, descale,
+    clean grinder) or the beans run low. While something is open, it reminds you once a day. The
+    notification disappears as soon as everything is booked as done.
+
+
+    Requires the coffeejunkie package and the Home Assistant Companion app.
+    Details: https://github.com/matthiasjobst87/coffeejunkie
+  domain: automation
+  author: matthiasj
+  source_url: https://github.com/matthiasjobst87/coffeejunkie/blob/main/blueprints/automation/coffeejunkie/coffeejunkie_reminders.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    devices:
+      name: Phones
+      description: Companion app devices that get the notification.
+      selector:
+        device:
+          multiple: true
+          filter:
+            - integration: mobile_app
+    beans_below:
+      name: Beans reminder below
+      description: Notify when the beans last for fewer brews than this. 0 = no bean reminder.
+      default: 10
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          mode: box
+          unit_of_measurement: brews
+    reminder_time:
+      name: Daily reminder
+      description: Time of the daily reminder while something is open.
+      default: "09:00:00"
+      selector:
+        time: {}
+    notify_from:
+      name: Notify from
+      description: No new notifications before this time. Something that becomes due earlier is sent with the daily reminder.
+      default: "08:00:00"
+      selector:
+        time: {}
+    notify_until:
+      name: Notify until
+      description: No new notifications after this time.
+      default: "21:00:00"
+      selector:
+        time: {}
+    people:
+      name: Only when someone is home
+      description: Notify only while at least one of these people is home. Leave empty to notify regardless of presence.
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: person
+    channel:
+      name: Android notification channel
+      description: Created on the first notification. Sound and importance can then be set per channel on the phone.
+      default: Coffeejunkie
+      selector:
+        text: {}
+
+triggers:
+  - trigger: state
+    id: care
+    entity_id:
+      - sensor.coffeejunkie_care_backflush
+      - sensor.coffeejunkie_care_descale
+      - sensor.coffeejunkie_care_grinder
+    not_from:
+      - unavailable
+      - unknown
+    not_to:
+      - unavailable
+      - unknown
+  - trigger: state
+    id: beans
+    entity_id: sensor.coffeejunkie_beans_left
+    not_from:
+      - unavailable
+      - unknown
+    not_to:
+      - unavailable
+      - unknown
+  - trigger: time
+    id: reminder
+    at: !input reminder_time
+
+variables:
+  devices: !input devices
+  beans_below: !input beans_below
+  notify_from: !input notify_from
+  notify_until: !input notify_until
+  people: !input people
+  channel: !input channel
+  labels:
+    backflush: Backflush
+    descale: Descale
+    grinder: Clean grinder
+  open_items: >-
+    {% set ns = namespace(l=[]) %}
+    {% for kind in ['backflush', 'descale', 'grinder'] %}
+      {% set e = 'sensor.coffeejunkie_care_' ~ kind %}
+      {% if is_state(e, 'due') %}
+        {% set t = state_attr(e, 'text') | string %}
+        {% set ns.l = ns.l + [labels[kind] ~ ': ' ~ (t[5:] if t.startswith('due: ') else t)] %}
+      {% endif %}
+    {% endfor %}
+    {% set b = states('sensor.coffeejunkie_beans_left') | int(-1) %}
+    {% if beans_below | int(0) > 0 and 0 <= b < beans_below | int(0) %}
+      {% set ns.l = ns.l + ['Beans: enough for ' ~ b ~ (' brew' if b == 1 else ' brews')] %}
+    {% endif %}
+    {{ ns.l }}
+  # Something became due or the beans dropped below the limit with this trigger
+  became_open: >-
+    {% if trigger.id == 'care' %}
+      {{ trigger.to_state.state == 'due' and trigger.from_state.state != 'due' }}
+    {% elif trigger.id == 'beans' %}
+      {% set lim = beans_below | int(0) %}
+      {{ lim > 0 and trigger.to_state.state | int(99999) < lim <= trigger.from_state.state | int(99999) }}
+    {% else %}false{% endif %}
+  # Something was booked as done (or a new bag opened) with this trigger
+  became_ok: >-
+    {% if trigger.id == 'care' %}
+      {{ trigger.from_state.state == 'due' and trigger.to_state.state != 'due' }}
+    {% elif trigger.id == 'beans' %}
+      {% set lim = beans_below | int(0) %}
+      {{ lim > 0 and trigger.from_state.state | int(99999) < lim <= trigger.to_state.state | int(99999) }}
+    {% else %}false{% endif %}
+  allowed: >-
+    {% set t = now().strftime('%H:%M:%S') %}
+    {% set in_time = (notify_from <= t < notify_until) if notify_from <= notify_until else (t >= notify_from or t < notify_until) %}
+    {% set home = (people | count == 0) or (people | select('is_state', 'home') | list | count > 0) %}
+    {{ in_time and home }}
+  message: "{{ open_items | join('\n') }}"
+
+conditions: []
+
+actions:
+  - choose:
+      # Everything done: remove the notification
+      - conditions:
+          - condition: template
+            value_template: "{{ became_ok and open_items | count == 0 }}"
+        sequence:
+          - repeat:
+              for_each: "{{ devices }}"
+              sequence:
+                - action: "notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}"
+                  continue_on_error: true
+                  data:
+                    message: clear_notification
+                    data:
+                      tag: coffeejunkie
+      # Something done and something still open: update the text (same tag, no new alert on Android),
+      # or something new / daily reminder within the allowed time
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ open_items | count > 0 and
+                 (became_ok or ((became_open or trigger.id == 'reminder') and allowed)) }}
+        sequence:
+          - repeat:
+              for_each: "{{ devices }}"
+              sequence:
+                - action: "notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}"
+                  continue_on_error: true
+                  data:
+                    title: Coffeejunkie
+                    message: "{{ message }}"
+                    data:
+                      tag: coffeejunkie
+                      channel: "{{ channel }}"
+                      importance: low
+                      alert_once: true
+                      notification_icon: mdi:coffee-maker
+                      push:
+                        interruption-level: passive
+
+mode: queued
+max: 5
