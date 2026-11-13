@@ -1,0 +1,871 @@
+# =====================================================================================================
+# coffeejunkie - espresso brew detection from the power readings of smart plugs
+# Version 1.0.0 · by matthiasj · MIT License · https://github.com/matthiasjobst87/coffeejunkie
+#
+# Counts espresso brews (and cappuccinos) of a simple espresso machine and a grinder, with nothing but
+# built-in Home Assistant parts: no Python, no shell_command, no custom integration.
+#
+# Two operating modes (input_select.coffeejunkie_mode):
+#   with_grinder  Trigger = grinder. A grind, followed within a few minutes by the pump of the machine,
+#                 is one brew. Reliable; needs a plug on the grinder.
+#   machine_only  Trigger = pump of the machine. A pump run of a configurable length is one brew. Needs
+#                 only the machine plug, but cannot tell a brew from a blind shot or from backflushing
+#                 with a cleaning tablet (these count too when they are as long as a brew).
+#
+# Milk frothing (cappuccino) = the machine heats continuously for a long time shortly after a brew.
+# Also included: counters (total, cappuccino, per day/week/month/year, by hour, by weekday, last 35 days,
+# last brews), maintenance reminders (backflush, descale, clean grinder) counted in brews and days,
+# and a bean stock.
+#
+# Setup: 1. Copy this file to <config>/packages/coffeejunkie.yaml and enable packages in
+#           configuration.yaml:   homeassistant:
+#                                   packages: !include_dir_named packages
+#        2. Enter the power sensors of your plugs in section 1 (the only place that names your entities).
+#        3. Restart Home Assistant. On the first start all settings are filled with defaults
+#           (script.coffeejunkie_reset_settings does the same on demand).
+#        4. Calibrate: compare the thresholds (helpers "Coffeejunkie ...") with the power curve of one brew.
+#
+# Requirement: the plugs must report power often (every 1-10 s). A plug that reports only every 30 s
+# or more cannot show a brew of 30 s.
+#
+# Defaults were measured on an Ascaso thermoblock machine with a Shelly Power Strip 4 Gen4 (about 1 value
+# per second): idle 11 W with heating pulses around 950 W; grinder > 100 W for 15-41 s; pump alone
+# 60-130 W, with heating about 1030 W; brew 30-80 s after the grinder, 25-50 s long.
+# =====================================================================================================
+
+# -----------------------------------------------------------------------------------------------------
+# 1. YOUR PLUGS - the only place to edit. Enter the power sensors (W) of the plugs.
+#    machine = the espresso machine, grinder = the grinder (can stay as it is in mode machine_only).
+# -----------------------------------------------------------------------------------------------------
+template:
+  - sensor:
+      - name: Coffeejunkie machine power
+        unique_id: coffeejunkie_machine_power
+        device_class: power
+        unit_of_measurement: W
+        state_class: measurement
+        state: "{{ states('sensor.espresso_machine_power') | float(0) }}"   # <-- EDIT: power sensor of the machine plug
+      - name: Coffeejunkie grinder power
+        unique_id: coffeejunkie_grinder_power
+        device_class: power
+        unit_of_measurement: W
+        state_class: measurement
+        state: "{{ states('sensor.grinder_power') | float(0) }}"        # <-- EDIT: power sensor of the grinder plug
+
+  # ---------------------------------------------------------------------------------------------------
+  # 2. DETECTION SENSORS (state based). All thresholds come from the helpers in section 6.
+  #    grinder running  : grinder above the threshold, held for the "hold" time (joins re-runs and stutter)
+  #    pump running     : machine in the pump band for "pump on" seconds without interruption
+  #    pump activity    : machine between pump minimum and heating threshold, bridged over short gaps
+  #                       (during a brew the heater switches in and out, a gap is not the end)
+  #    portafilter active: machine above "active minimum" for "active on" seconds without interruption;
+  #                       second way to see a brew when the heater keeps heating during the brew, and the
+  #                       start signal in mode machine_only
+  #    heating          : machine above the heating threshold for "heating" seconds (steam preparation)
+  # ---------------------------------------------------------------------------------------------------
+  - binary_sensor:
+      - name: Coffeejunkie grinder running
+        unique_id: coffeejunkie_grinder_running
+        icon: mdi:grain
+        delay_off: "{{ states('input_number.coffeejunkie_grinder_hold_s') | int(30) | timestamp_custom('%H:%M:%S', false) }}"
+        state: "{{ states('sensor.coffeejunkie_grinder_power') | float(0) > states('input_number.coffeejunkie_grinder_on_w') | float(100) }}"
+      - name: Coffeejunkie pump running
+        unique_id: coffeejunkie_pump_running
+        icon: mdi:water-pump
+        delay_on: "{{ states('input_number.coffeejunkie_pump_on_s') | int(5) | timestamp_custom('%H:%M:%S', false) }}"
+        state: >-
+          {{ states('input_number.coffeejunkie_pump_min_w') | float(60)
+             <= states('sensor.coffeejunkie_machine_power') | float(0)
+             <= states('input_number.coffeejunkie_pump_max_w') | float(130) }}
+      - name: Coffeejunkie pump activity
+        unique_id: coffeejunkie_pump_activity
+        icon: mdi:water-sync
+        delay_off: "{{ states('input_number.coffeejunkie_pump_gap_s') | int(10) | timestamp_custom('%H:%M:%S', false) }}"
+        state: >-
+          {{ states('input_number.coffeejunkie_pump_min_w') | float(60)
+             <= states('sensor.coffeejunkie_machine_power') | float(0)
+             <= states('input_number.coffeejunkie_heat_w') | float(900) }}
+      - name: Coffeejunkie portafilter active
+        unique_id: coffeejunkie_portafilter_active
+        icon: mdi:coffee-maker
+        delay_on: "{{ states('input_number.coffeejunkie_active_on_s') | int(15) | timestamp_custom('%H:%M:%S', false) }}"
+        state: "{{ states('sensor.coffeejunkie_machine_power') | float(0) >= states('input_number.coffeejunkie_active_min_w') | float(60) }}"
+      - name: Coffeejunkie heating
+        unique_id: coffeejunkie_heating
+        icon: mdi:fire
+        delay_on: "{{ states('input_number.coffeejunkie_heat_s') | int(90) | timestamp_custom('%H:%M:%S', false) }}"
+        state: "{{ states('sensor.coffeejunkie_machine_power') | float(0) > states('input_number.coffeejunkie_heat_w') | float(900) }}"
+
+  # ---------------------------------------------------------------------------------------------------
+  # 3. COUNTERS. The automations below fire the events coffeejunkie_brew and coffeejunkie_milk; these
+  #    trigger based sensors count them themselves. Home Assistant restores their state and attributes
+  #    after a restart, so nothing is lost. There is no database and no file behind them.
+  #    total / cappuccino_total : numbers of brews; a cappuccino is also counted as a brew.
+  #    distribution (state = total) attributes:
+  #      hours, hours_cappuccino  24 values, index 0 = 00:00-00:59, since the start
+  #      weekdays                 7 values, Monday to Sunday, since the start
+  #      days, days_cappuccino    date -> count, the last 35 days including today (also days with 0)
+  #      recent                   the ten latest brews, newest first: time (ISO) and type (espresso/cappuccino)
+  #      since                    date of the first brew
+  #    The 35 days move on at 00:00:05.
+  # ---------------------------------------------------------------------------------------------------
+  - triggers:
+      - trigger: event
+        event_type: coffeejunkie_brew
+      - trigger: event
+        event_type: coffeejunkie_milk
+      - trigger: homeassistant
+        event: start
+      - trigger: time
+        at: "00:00:05"
+    variables:
+      d: >-
+        {% set dist = 'sensor.coffeejunkie_distribution' %}
+        {% set evt = trigger.event.event_type if trigger.platform == 'event' else '' %}
+        {% set brew = evt == 'coffeejunkie_brew' %}
+        {% set milk = evt == 'coffeejunkie_milk' %}
+        {% set ev = as_local(as_datetime(trigger.event.data.get('time') or now().isoformat())).replace(microsecond=0) if (brew or milk) else none %}
+        {% set evs = ev.isoformat() if ev else '' %}
+        {% set evday = ev.strftime('%Y-%m-%d') if ev else '' %}
+        {% set oh = (state_attr(dist, 'hours') or []) + [0] * 24 %}
+        {% set ohc = (state_attr(dist, 'hours_cappuccino') or []) + [0] * 24 %}
+        {% set ow = (state_attr(dist, 'weekdays') or []) + [0] * 7 %}
+        {% set od = state_attr(dist, 'days') or {} %}
+        {% set odc = state_attr(dist, 'days_cappuccino') or {} %}
+        {% set orc = state_attr(dist, 'recent') or [] %}
+        {% set ns = namespace(h=[], hc=[], w=[], dd=[], dc=[], rec=[]) %}
+        {% for i in range(24) %}
+          {% set ns.h = ns.h + [oh[i] + (1 if brew and ev.hour == i else 0)] %}
+          {% set ns.hc = ns.hc + [ohc[i] + (1 if milk and ev.hour == i else 0)] %}
+        {% endfor %}
+        {% for i in range(7) %}
+          {% set ns.w = ns.w + [ow[i] + (1 if brew and ev.weekday() == i else 0)] %}
+        {% endfor %}
+        {% for i in range(34, -1, -1) %}
+          {% set day = (now() - timedelta(days=i)).strftime('%Y-%m-%d') %}
+          {% set ns.dd = ns.dd + [[day, (od.get(day, 0) | int(0)) + (1 if brew and evday == day else 0)]] %}
+          {% set ns.dc = ns.dc + [[day, (odc.get(day, 0) | int(0)) + (1 if milk and evday == day else 0)]] %}
+        {% endfor %}
+        {% for r in orc %}
+          {% set ns.rec = ns.rec + [({'time': r.time, 'type': 'cappuccino'} if (milk and r.time == evs) else r)] %}
+        {% endfor %}
+        {% if brew %}{% set ns.rec = [{'time': evs, 'type': 'espresso'}] + ns.rec %}{% endif %}
+        {{ {
+          'total': (states('sensor.coffeejunkie_total') | int(0)) + (1 if brew else 0),
+          'cappuccino': (states('sensor.coffeejunkie_cappuccino_total') | int(0)) + (1 if milk else 0),
+          'hours': ns.h, 'hours_cappuccino': ns.hc, 'weekdays': ns.w,
+          'days': dict(ns.dd), 'days_cappuccino': dict(ns.dc),
+          'recent': ns.rec[:10],
+          'since': state_attr(dist, 'since') or evday
+        } }}
+    sensor:
+      - name: Coffeejunkie total
+        unique_id: coffeejunkie_total
+        unit_of_measurement: brews
+        state_class: total_increasing
+        icon: mdi:coffee
+        state: "{{ d.total }}"
+      - name: Coffeejunkie cappuccino total
+        unique_id: coffeejunkie_cappuccino_total
+        unit_of_measurement: brews
+        state_class: total_increasing
+        icon: mdi:coffee-outline
+        state: "{{ d.cappuccino }}"
+      - name: Coffeejunkie distribution
+        unique_id: coffeejunkie_distribution
+        icon: mdi:chart-bar
+        state: "{{ d.total }}"
+        attributes:
+          hours: "{{ d.hours }}"
+          hours_cappuccino: "{{ d.hours_cappuccino }}"
+          weekdays: "{{ d.weekdays }}"
+          days: "{{ d.days }}"
+          days_cappuccino: "{{ d.days_cappuccino }}"
+          recent: "{{ d.recent }}"
+          since: "{{ d.since }}"
+
+  # ---------------------------------------------------------------------------------------------------
+  # 4. MAINTENANCE. Due as soon as the distance in brews OR in days is reached, whichever comes first
+  #    (distance 0 = this limit does not count). State: ok / due. Attributes: text, last_done,
+  #    days_since, brews_since, days_left, brews_left. "Done" is booked with the scripts of section 7.
+  # ---------------------------------------------------------------------------------------------------
+  - triggers:
+      - trigger: time_pattern
+        minutes: "/30"
+      - trigger: state
+        entity_id:
+          - sensor.coffeejunkie_total
+          - input_datetime.coffeejunkie_backflush_last
+          - input_datetime.coffeejunkie_descale_last
+          - input_datetime.coffeejunkie_grinder_last
+          - input_number.coffeejunkie_backflush_count_at
+          - input_number.coffeejunkie_descale_count_at
+          - input_number.coffeejunkie_grinder_count_at
+          - input_number.coffeejunkie_backflush_every_brews
+          - input_number.coffeejunkie_backflush_every_days
+          - input_number.coffeejunkie_descale_every_brews
+          - input_number.coffeejunkie_descale_every_days
+          - input_number.coffeejunkie_grinder_every_brews
+          - input_number.coffeejunkie_grinder_every_days
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: event_template_reloaded
+    variables:
+      total: "{{ states('sensor.coffeejunkie_total') | int(0) }}"
+      care: >-
+        {% set ns = namespace(l=[]) %}
+        {% for kind in ['backflush', 'descale', 'grinder'] %}
+          {% set ts = state_attr('input_datetime.coffeejunkie_' ~ kind ~ '_last', 'timestamp') %}
+          {% set days = ((now().timestamp() - ts) / 86400) | int if ts else none %}
+          {% set brews = total - (states('input_number.coffeejunkie_' ~ kind ~ '_count_at') | int(0)) %}
+          {% set dl = states('input_number.coffeejunkie_' ~ kind ~ '_every_days') | int(0) %}
+          {% set bl = states('input_number.coffeejunkie_' ~ kind ~ '_every_brews') | int(0) %}
+          {% set rd = (dl - days) if dl > 0 and days is not none else none %}
+          {% set rb = (bl - brews) if bl > 0 else none %}
+          {% set due = (rd is not none and rd <= 0) or (rb is not none and rb <= 0) %}
+          {% set parts = namespace(l=[]) %}
+          {% if due %}
+            {% if rb is not none and rb <= 0 %}{% set parts.l = parts.l + [brews ~ ' brews since the last time'] %}{% endif %}
+            {% if rd is not none and rd <= 0 %}{% set parts.l = parts.l + [days ~ ' days since the last time'] %}{% endif %}
+            {% set text = 'due: ' ~ (parts.l | join(' and ')) %}
+          {% else %}
+            {% if rb is not none %}{% set parts.l = parts.l + [rb ~ ' brews'] %}{% endif %}
+            {% if rd is not none %}{% set parts.l = parts.l + [rd ~ ' days'] %}{% endif %}
+            {% set text = ('in ' ~ (parts.l | join(' or '))) if parts.l else 'no limit set' %}
+          {% endif %}
+          {% set ns.l = ns.l + [[kind, {
+            'due': due,
+            'text': text,
+            'last_done': (ts | timestamp_custom('%Y-%m-%d', true)) if ts else '',
+            'days_since': days,
+            'brews_since': brews,
+            'days_left': rd,
+            'brews_left': rb
+          }]] %}
+        {% endfor %}
+        {{ dict(ns.l) }}
+    sensor:
+      - name: Coffeejunkie care backflush
+        unique_id: coffeejunkie_care_backflush
+        icon: mdi:coffee-maker
+        state: "{{ 'due' if care.backflush.due else 'ok' }}"
+        attributes:
+          text: "{{ care.backflush.text }}"
+          last_done: "{{ care.backflush.last_done }}"
+          days_since: "{{ care.backflush.days_since }}"
+          brews_since: "{{ care.backflush.brews_since }}"
+          days_left: "{{ care.backflush.days_left }}"
+          brews_left: "{{ care.backflush.brews_left }}"
+      - name: Coffeejunkie care descale
+        unique_id: coffeejunkie_care_descale
+        icon: mdi:water-opacity
+        state: "{{ 'due' if care.descale.due else 'ok' }}"
+        attributes:
+          text: "{{ care.descale.text }}"
+          last_done: "{{ care.descale.last_done }}"
+          days_since: "{{ care.descale.days_since }}"
+          brews_since: "{{ care.descale.brews_since }}"
+          days_left: "{{ care.descale.days_left }}"
+          brews_left: "{{ care.descale.brews_left }}"
+      - name: Coffeejunkie care grinder
+        unique_id: coffeejunkie_care_grinder
+        icon: mdi:grain
+        state: "{{ 'due' if care.grinder.due else 'ok' }}"
+        attributes:
+          text: "{{ care.grinder.text }}"
+          last_done: "{{ care.grinder.last_done }}"
+          days_since: "{{ care.grinder.days_since }}"
+          brews_since: "{{ care.grinder.brews_since }}"
+          days_left: "{{ care.grinder.days_left }}"
+          brews_left: "{{ care.grinder.brews_left }}"
+
+  # ---------------------------------------------------------------------------------------------------
+  # 5. BEAN STOCK. Every brew takes "grams per brew" from the stock; script.coffeejunkie_new_bag sets it
+  #    back to the bag size.
+  # ---------------------------------------------------------------------------------------------------
+  - sensor:
+      - name: Coffeejunkie beans left
+        unique_id: coffeejunkie_beans_left
+        unit_of_measurement: brews
+        icon: mdi:coffee-maker-outline
+        state: >-
+          {% set g = states('input_number.coffeejunkie_grams_per_brew') | float(0) %}
+          {{ ((states('input_number.coffeejunkie_stock_g') | float(0)) / g) | int if g > 0 else none }}
+        attributes:
+          stock_g: "{{ states('input_number.coffeejunkie_stock_g') | float(0) }}"
+          bag_g: "{{ states('input_number.coffeejunkie_bag_g') | float(0) }}"
+          grams_per_brew: "{{ states('input_number.coffeejunkie_grams_per_brew') | float(0) }}"
+          percent: >-
+            {% set p = states('input_number.coffeejunkie_bag_g') | float(0) %}
+            {{ ((states('input_number.coffeejunkie_stock_g') | float(0)) / p * 100) | round(0) | int if p > 0 else none }}
+
+# -----------------------------------------------------------------------------------------------------
+# Counter periods (day, week, month, year) of both totals. Creating utility meters needs a restart.
+# -----------------------------------------------------------------------------------------------------
+utility_meter:
+  coffeejunkie_today:
+    name: Coffeejunkie today
+    source: sensor.coffeejunkie_total
+    cycle: daily
+  coffeejunkie_week:
+    name: Coffeejunkie week
+    source: sensor.coffeejunkie_total
+    cycle: weekly
+  coffeejunkie_month:
+    name: Coffeejunkie month
+    source: sensor.coffeejunkie_total
+    cycle: monthly
+  coffeejunkie_year:
+    name: Coffeejunkie year
+    source: sensor.coffeejunkie_total
+    cycle: yearly
+  coffeejunkie_cappuccino_today:
+    name: Coffeejunkie cappuccino today
+    source: sensor.coffeejunkie_cappuccino_total
+    cycle: daily
+  coffeejunkie_cappuccino_week:
+    name: Coffeejunkie cappuccino week
+    source: sensor.coffeejunkie_cappuccino_total
+    cycle: weekly
+  coffeejunkie_cappuccino_month:
+    name: Coffeejunkie cappuccino month
+    source: sensor.coffeejunkie_cappuccino_total
+    cycle: monthly
+  coffeejunkie_cappuccino_year:
+    name: Coffeejunkie cappuccino year
+    source: sensor.coffeejunkie_cappuccino_total
+    cycle: yearly
+
+# -----------------------------------------------------------------------------------------------------
+# 6. HELPERS. Settings can be changed in the dashboard (Settings > Devices & services > Helpers).
+#    The defaults are set by script.coffeejunkie_reset_settings on the first start (not "initial:", so a
+#    restart never overwrites your changes).
+# -----------------------------------------------------------------------------------------------------
+input_select:
+  coffeejunkie_mode:
+    name: Coffeejunkie mode
+    icon: mdi:coffee-maker
+    options:
+      - with_grinder
+      - machine_only
+
+input_boolean:
+  # Milk frothing was already counted for the latest brew (one cappuccino per brew)
+  coffeejunkie_milk_counted:
+    name: Coffeejunkie milk counted
+    icon: mdi:cup
+  # First-run setup done
+  coffeejunkie_initialized:
+    name: Coffeejunkie initialized
+    icon: mdi:check
+
+input_datetime:
+  coffeejunkie_last_brew:
+    name: Coffeejunkie last brew
+    has_date: true
+    has_time: true
+  coffeejunkie_backflush_last:
+    name: Coffeejunkie backflush last done
+    has_date: true
+    has_time: true
+  coffeejunkie_descale_last:
+    name: Coffeejunkie descale last done
+    has_date: true
+    has_time: true
+  coffeejunkie_grinder_last:
+    name: Coffeejunkie grinder cleaning last done
+    has_date: true
+    has_time: true
+
+input_number:
+  # --- grinder
+  coffeejunkie_grinder_on_w:
+    name: Coffeejunkie grinder runs above
+    min: 5
+    max: 3000
+    step: 5
+    mode: box
+    unit_of_measurement: W
+    icon: mdi:grain
+  coffeejunkie_grinder_hold_s:
+    name: Coffeejunkie grinder hold time
+    min: 0
+    max: 300
+    step: 1
+    mode: box
+    unit_of_measurement: s
+    icon: mdi:timer-sand
+  coffeejunkie_grinder_clean_s:
+    name: Coffeejunkie grind without brew counts as cleaning from (0 = off)
+    min: 0
+    max: 300
+    step: 5
+    mode: box
+    unit_of_measurement: s
+    icon: mdi:timer-sand
+  # --- pump
+  coffeejunkie_pump_min_w:
+    name: Coffeejunkie pump band from
+    min: 5
+    max: 3000
+    step: 5
+    mode: box
+    unit_of_measurement: W
+    icon: mdi:water-pump
+  coffeejunkie_pump_max_w:
+    name: Coffeejunkie pump band up to
+    min: 5
+    max: 3000
+    step: 5
+    mode: box
+    unit_of_measurement: W
+    icon: mdi:water-pump
+  coffeejunkie_pump_on_s:
+    name: Coffeejunkie pump must stay in the band for
+    min: 0
+    max: 60
+    step: 1
+    mode: box
+    unit_of_measurement: s
+    icon: mdi:timer-sand
+  coffeejunkie_pump_gap_s:
+    name: Coffeejunkie pump activity bridges gaps up to
+    min: 0
+    max: 60
+    step: 1
+    mode: box
+    unit_of_measurement: s
+    icon: mdi:timer-sand
+  coffeejunkie_pump_wait_s:
+    name: Coffeejunkie pump must follow the grinder within
+    min: 30
+    max: 900
+    step: 10
+    mode: box
+    unit_of_measurement: s
+    icon: mdi:timer-sand
+  coffeejunkie_active_min_w:
+    name: Coffeejunkie portafilter active from
+    min: 5
+    max: 3000
+    step: 5
+    mode: box
+    unit_of_measurement: W
+    icon: mdi:coffee-maker
+  coffeejunkie_active_on_s:
+    name: Coffeejunkie portafilter active after
+    min: 0
+    max: 120
+    step: 1
+    mode: box
+    unit_of_measurement: s
+    icon: mdi:timer-sand
+  # --- machine_only: length of a brew, measured from the start to the end of the pump activity
+  coffeejunkie_brew_min_s:
+    name: Coffeejunkie machine_only brew at least
+    min: 5
+    max: 300
+    step: 1
+    mode: box
+    unit_of_measurement: s
+    icon: mdi:timer-sand
+  coffeejunkie_brew_max_s:
+    name: Coffeejunkie machine_only brew at most
+    min: 10
+    max: 600
+    step: 1
+    mode: box
+    unit_of_measurement: s
+    icon: mdi:timer-sand
+  # --- milk
+  coffeejunkie_heat_w:
+    name: Coffeejunkie heating above
+    min: 100
+    max: 5000
+    step: 10
+    mode: box
+    unit_of_measurement: W
+    icon: mdi:fire
+  coffeejunkie_heat_s:
+    name: Coffeejunkie heating must last
+    min: 10
+    max: 600
+    step: 5
+    mode: box
+    unit_of_measurement: s
+    icon: mdi:timer-sand
+  coffeejunkie_milk_window_s:
+    name: Coffeejunkie milk heating must come within (after the brew)
+    min: 60
+    max: 900
+    step: 5
+    mode: box
+    unit_of_measurement: s
+    icon: mdi:timer-sand
+  # --- maintenance (0 = this limit does not count)
+  coffeejunkie_backflush_every_brews:
+    name: Coffeejunkie backflush every ... brews
+    min: 0
+    max: 1000
+    step: 5
+    mode: box
+    icon: mdi:coffee
+  coffeejunkie_backflush_every_days:
+    name: Coffeejunkie backflush every ... days
+    min: 0
+    max: 365
+    step: 1
+    mode: box
+    icon: mdi:calendar-clock
+  coffeejunkie_descale_every_brews:
+    name: Coffeejunkie descale every ... brews
+    min: 0
+    max: 5000
+    step: 5
+    mode: box
+    icon: mdi:coffee
+  coffeejunkie_descale_every_days:
+    name: Coffeejunkie descale every ... days
+    min: 0
+    max: 730
+    step: 1
+    mode: box
+    icon: mdi:calendar-clock
+  coffeejunkie_grinder_every_brews:
+    name: Coffeejunkie clean grinder every ... brews
+    min: 0
+    max: 1000
+    step: 5
+    mode: box
+    icon: mdi:coffee
+  coffeejunkie_grinder_every_days:
+    name: Coffeejunkie clean grinder every ... days
+    min: 0
+    max: 365
+    step: 1
+    mode: box
+    icon: mdi:calendar-clock
+  # total count at the time of the last maintenance (set by the "done" scripts)
+  coffeejunkie_backflush_count_at:
+    name: Coffeejunkie count at last backflush
+    min: 0
+    max: 1000000
+    step: 1
+    mode: box
+  coffeejunkie_descale_count_at:
+    name: Coffeejunkie count at last descale
+    min: 0
+    max: 1000000
+    step: 1
+    mode: box
+  coffeejunkie_grinder_count_at:
+    name: Coffeejunkie count at last grinder cleaning
+    min: 0
+    max: 1000000
+    step: 1
+    mode: box
+  # --- beans
+  coffeejunkie_bag_g:
+    name: Coffeejunkie bag size
+    min: 100
+    max: 5000
+    step: 50
+    mode: box
+    unit_of_measurement: g
+    icon: mdi:coffee-maker-outline
+  coffeejunkie_grams_per_brew:
+    name: Coffeejunkie grams per brew
+    min: 5
+    max: 40
+    step: 0.5
+    mode: box
+    unit_of_measurement: g
+    icon: mdi:scale
+  coffeejunkie_stock_g:
+    name: Coffeejunkie bean stock
+    min: 0
+    max: 5000
+    step: 1
+    mode: box
+    unit_of_measurement: g
+    icon: mdi:coffee-maker-outline
+
+# -----------------------------------------------------------------------------------------------------
+# 7. SCRIPTS
+# -----------------------------------------------------------------------------------------------------
+script:
+  # Books one brew: time of the brew, bean stock, event for the counters. Called by the detection.
+  coffeejunkie_record_brew:
+    alias: "Coffeejunkie: record brew"
+    icon: mdi:coffee
+    description: >-
+      Books one brew (time of the brew, bean stock, event coffeejunkie_brew for the counters).
+      Called by the detection automations; can also be called by hand to add a brew that was missed.
+    fields:
+      time:
+        description: Time of the brew as ISO timestamp (default = now)
+        example: "2026-11-04T08:15:00+01:00"
+      grind_s:
+        description: Length of the grind in seconds (0 = unknown)
+        example: 25
+    mode: queued
+    max: 5
+    sequence:
+      - variables:
+          brew_time: "{{ (as_datetime(time) | as_local).replace(microsecond=0).isoformat() if time is defined and time else now().replace(microsecond=0).isoformat() }}"
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.coffeejunkie_last_brew
+        data:
+          datetime: "{{ brew_time[:19] | replace('T', ' ') }}"
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.coffeejunkie_milk_counted
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.coffeejunkie_stock_g
+        data:
+          value: "{{ [0, states('input_number.coffeejunkie_stock_g') | float(0) - states('input_number.coffeejunkie_grams_per_brew') | float(0)] | max }}"
+      - event: coffeejunkie_brew
+        event_data:
+          time: "{{ brew_time }}"
+          grind_s: "{{ grind_s | default(0, true) }}"
+
+  # Books a maintenance as done: date = now, brews counted from here.
+  coffeejunkie_care_done:
+    alias: "Coffeejunkie: maintenance done"
+    icon: mdi:coffee-maker-check
+    fields:
+      kind:
+        description: backflush, descale or grinder
+        example: descale
+    mode: queued
+    sequence:
+      - condition: template
+        value_template: "{{ kind | default('') in ['backflush', 'descale', 'grinder'] }}"
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: "input_datetime.coffeejunkie_{{ kind }}_last"
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - action: input_number.set_value
+        target:
+          entity_id: "input_number.coffeejunkie_{{ kind }}_count_at"
+        data:
+          value: "{{ states('sensor.coffeejunkie_total') | int(0) }}"
+
+  coffeejunkie_backflush_done:
+    alias: "Coffeejunkie: backflush done"
+    icon: mdi:coffee-maker-check
+    sequence:
+      - action: script.coffeejunkie_care_done
+        data:
+          kind: backflush
+  coffeejunkie_descale_done:
+    alias: "Coffeejunkie: descale done"
+    icon: mdi:water-check
+    sequence:
+      - action: script.coffeejunkie_care_done
+        data:
+          kind: descale
+  coffeejunkie_grinder_done:
+    alias: "Coffeejunkie: grinder cleaned"
+    icon: mdi:grain
+    sequence:
+      - action: script.coffeejunkie_care_done
+        data:
+          kind: grinder
+
+  # Opened a new bag: stock back to the bag size.
+  coffeejunkie_new_bag:
+    alias: "Coffeejunkie: new bag"
+    icon: mdi:coffee-maker-outline
+    sequence:
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.coffeejunkie_stock_g
+        data:
+          value: "{{ states('input_number.coffeejunkie_bag_g') | float(500) }}"
+
+  # All settings back to the defaults (Ascaso thermoblock machine, Shelly Power Strip 4 Gen4).
+  coffeejunkie_reset_settings:
+    alias: "Coffeejunkie: reset settings to defaults"
+    icon: mdi:restore
+    sequence:
+      - repeat:
+          for_each:
+            - {id: grinder_on_w, value: 100}
+            - {id: grinder_hold_s, value: 30}
+            - {id: grinder_clean_s, value: 45}
+            - {id: pump_min_w, value: 60}
+            - {id: pump_max_w, value: 130}
+            - {id: pump_on_s, value: 5}
+            - {id: pump_gap_s, value: 10}
+            - {id: pump_wait_s, value: 300}
+            - {id: active_min_w, value: 60}
+            - {id: active_on_s, value: 15}
+            - {id: brew_min_s, value: 28}
+            - {id: brew_max_s, value: 70}
+            - {id: heat_w, value: 900}
+            - {id: heat_s, value: 90}
+            - {id: milk_window_s, value: 315}
+            - {id: backflush_every_brews, value: 40}
+            - {id: backflush_every_days, value: 14}
+            - {id: descale_every_brews, value: 0}
+            - {id: descale_every_days, value: 90}
+            - {id: grinder_every_brews, value: 100}
+            - {id: grinder_every_days, value: 56}
+            - {id: bag_g, value: 500}
+            - {id: grams_per_brew, value: 18}
+          sequence:
+            - action: input_number.set_value
+              target:
+                entity_id: "input_number.coffeejunkie_{{ repeat.item.id }}"
+              data:
+                value: "{{ repeat.item.value }}"
+
+# -----------------------------------------------------------------------------------------------------
+# 8. AUTOMATIONS
+# -----------------------------------------------------------------------------------------------------
+automation:
+  # First start: fill in the defaults, start the maintenance clocks, fill the bean stock.
+  - id: coffeejunkie_first_run
+    alias: "Coffeejunkie: first run setup"
+    triggers:
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: automation_reloaded
+    conditions:
+      - condition: state
+        entity_id: input_boolean.coffeejunkie_initialized
+        state: "off"
+    actions:
+      - action: script.coffeejunkie_reset_settings
+      - action: script.coffeejunkie_care_done
+        data:
+          kind: backflush
+      - action: script.coffeejunkie_care_done
+        data:
+          kind: descale
+      - action: script.coffeejunkie_care_done
+        data:
+          kind: grinder
+      - action: script.coffeejunkie_new_bag
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.coffeejunkie_initialized
+    mode: single
+
+  # Mode with_grinder: grinder runs, then within "pump wait" seconds the pump (or the active portafilter).
+  # A grind without a brew that is long enough books the grinder cleaning (grinder cleaning threshold, 0 = off).
+  - id: coffeejunkie_detect_with_grinder
+    alias: "Coffeejunkie: detect brew (with grinder)"
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.coffeejunkie_grinder_running
+        to: "on"
+    conditions:
+      - condition: state
+        entity_id: input_select.coffeejunkie_mode
+        state: with_grinder
+    actions:
+      - variables:
+          grind_start: "{{ trigger.to_state.last_changed.timestamp() }}"
+      - wait_for_trigger:
+          - trigger: state
+            entity_id: binary_sensor.coffeejunkie_grinder_running
+            to: "off"
+        timeout: "00:10:00"
+        continue_on_timeout: false
+      - variables:
+          grind_s: "{{ (now().timestamp() - grind_start - states('input_number.coffeejunkie_grinder_hold_s') | float(30)) | round(0) | int }}"
+      - wait_template: "{{ is_state('binary_sensor.coffeejunkie_pump_running', 'on') or is_state('binary_sensor.coffeejunkie_portafilter_active', 'on') }}"
+        timeout: "{{ states('input_number.coffeejunkie_pump_wait_s') | int(300) | timestamp_custom('%H:%M:%S', false) }}"
+        continue_on_timeout: true
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ wait.completed }}"
+            sequence:
+              - action: script.coffeejunkie_record_brew
+                data:
+                  time: "{{ now().isoformat() }}"
+                  grind_s: "{{ grind_s }}"
+          - conditions:
+              - condition: template
+                value_template: "{{ states('input_number.coffeejunkie_grinder_clean_s') | float(0) > 0 and grind_s >= states('input_number.coffeejunkie_grinder_clean_s') | float(0) }}"
+            sequence:
+              - action: script.coffeejunkie_care_done
+                data:
+                  kind: grinder
+              - action: logbook.log
+                data:
+                  name: Coffeejunkie
+                  message: "Grinder cleaning detected: grind of {{ grind_s }} s without a brew."
+    mode: single
+    max_exceeded: silent
+
+  # Mode machine_only: the portafilter becomes active while the pump activity runs. The brew counts when the
+  # pump activity, from its start to its end, lasts at least "brew at least" and at most "brew at most".
+  # Shorter = rinse / steam pump, longer = descaling or similar. The start does not wait for the pump alone:
+  # on some brews the heater switches in and out from the first second.
+  - id: coffeejunkie_detect_machine_only
+    alias: "Coffeejunkie: detect brew (machine only)"
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.coffeejunkie_portafilter_active
+        to: "on"
+    conditions:
+      - condition: state
+        entity_id: input_select.coffeejunkie_mode
+        state: machine_only
+      - condition: state
+        entity_id: binary_sensor.coffeejunkie_pump_activity
+        state: "on"
+    actions:
+      - variables:
+          pump_start: "{{ states.binary_sensor.coffeejunkie_pump_activity.last_changed.isoformat() }}"
+          pump_start_ts: "{{ states.binary_sensor.coffeejunkie_pump_activity.last_changed.timestamp() }}"
+      - wait_for_trigger:
+          - trigger: state
+            entity_id: binary_sensor.coffeejunkie_pump_activity
+            to: "off"
+        timeout: "{{ states('input_number.coffeejunkie_brew_max_s') | int(70) | timestamp_custom('%H:%M:%S', false) }}"
+        continue_on_timeout: false
+      - condition: template
+        value_template: >-
+          {% set run = now().timestamp() - pump_start_ts | float(0) %}
+          {{ states('input_number.coffeejunkie_brew_min_s') | float(28) <= run
+             <= states('input_number.coffeejunkie_brew_max_s') | float(70) }}
+      - action: script.coffeejunkie_record_brew
+        data:
+          time: "{{ pump_start }}"
+          grind_s: 0
+    mode: single
+    max_exceeded: silent
+
+  # Milk frothing: continuous heating shortly after a brew = cappuccino (one per brew).
+  - id: coffeejunkie_detect_milk
+    alias: "Coffeejunkie: detect milk frothing"
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.coffeejunkie_heating
+        to: "on"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.coffeejunkie_milk_counted
+        state: "off"
+      - condition: template
+        value_template: >-
+          {{ 0 <= now().timestamp() - state_attr('input_datetime.coffeejunkie_last_brew', 'timestamp') | float(0)
+             <= states('input_number.coffeejunkie_milk_window_s') | float(315) }}
+    actions:
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.coffeejunkie_milk_counted
+      - event: coffeejunkie_milk
+        event_data:
+          time: "{{ state_attr('input_datetime.coffeejunkie_last_brew', 'timestamp') | timestamp_local }}"
+    mode: single
