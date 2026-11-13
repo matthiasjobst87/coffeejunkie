@@ -1,0 +1,272 @@
+# coffeejunkie - example view, built-in cards only (no HACS needed).
+# Use: Settings > Dashboards > Add dashboard > New dashboard from scratch, open it, three dots > Edit dashboard >
+# three dots > Raw configuration editor, replace everything with this file and save.
+# To add it to an existing dashboard instead, copy only the part below "views:" into that dashboard's views.
+views:
+  - title: Coffee
+    path: coffee
+    icon: mdi:coffee
+    type: sections
+    max_columns: 3
+    sections:
+      - type: grid
+        cards:
+          - type: heading
+            heading: Brews
+            icon: mdi:coffee
+          - type: tile
+            entity: sensor.coffeejunkie_today
+            name: Today
+            icon: mdi:coffee
+          - type: tile
+            entity: sensor.coffeejunkie_week
+            name: This week
+            icon: mdi:calendar-week
+          - type: tile
+            entity: sensor.coffeejunkie_month
+            name: This month
+            icon: mdi:calendar-month
+          - type: tile
+            entity: sensor.coffeejunkie_total
+            name: Total
+            icon: mdi:counter
+          - type: tile
+            entity: sensor.coffeejunkie_cappuccino_month
+            name: Cappuccino this month
+            icon: mdi:coffee-outline
+          - type: tile
+            entity: sensor.coffeejunkie_cappuccino_total
+            name: Cappuccino total
+            icon: mdi:coffee-outline
+          - type: statistics-graph
+            title: Brews per day
+            entities:
+              - entity: sensor.coffeejunkie_total
+                name: Brews
+              - entity: sensor.coffeejunkie_cappuccino_total
+                name: of these cappuccino
+            stat_types:
+              - change
+            period: day
+            days_to_show: 30
+            chart_type: bar
+            hide_legend: false
+            grid_options:
+              columns: full
+          - type: markdown
+            title: Latest brews
+            content: >-
+              {% set ns = namespace(l=[]) %}
+              {% for b in state_attr('sensor.coffeejunkie_distribution', 'recent') or [] %}
+              {% set ns.l = ns.l + [as_timestamp(b.time) | timestamp_custom('%a %d %b, %H:%M') ~ ' · ' ~ b.type] %}
+              {% endfor %}
+              {{ ns.l | join('  \n') if ns.l else 'No brews yet.' }}
+            grid_options:
+              columns: full
+
+      - type: grid
+        cards:
+          - type: heading
+            heading: When
+            icon: mdi:clock-outline
+          - type: markdown
+            title: By hour
+            content: >-
+              {% set h = state_attr('sensor.coffeejunkie_distribution', 'hours') or [] %}
+              {% set m = (h | max) if h else 0 %}
+              {% set ns = namespace(l=[]) %}
+              {% for i in range(h | count) %}{% if h[i] > 0 %}
+              {% set ns.l = ns.l + ['`' ~ ('%02d' % i) ~ ':00` ' ~ '█' * ((h[i] / m * 20) | round(0, 'ceil') | int) ~ ' ' ~ h[i]] %}
+              {% endif %}{% endfor %}
+              {{ ns.l | join('  \n') if m > 0 else 'No brews yet.' }}
+            grid_options:
+              columns: full
+          - type: markdown
+            title: By weekday
+            content: >-
+              {% set w = state_attr('sensor.coffeejunkie_distribution', 'weekdays') or [] %}
+              {% set m = (w | max) if w else 0 %}
+              {% set names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] %}
+              {% set ns = namespace(l=[]) %}
+              {% for i in range([w | count, 7] | min) %}
+              {% set ns.l = ns.l + ['`' ~ names[i] ~ '` ' ~ '█' * ((w[i] / m * 20) | round(0, 'ceil') | int) ~ ' ' ~ w[i]] %}
+              {% endfor %}
+              {{ (ns.l | join('  \n') ~ '\n\nSince ' ~ state_attr('sensor.coffeejunkie_distribution', 'since')) if m > 0 else 'No brews yet.' }}
+            grid_options:
+              columns: full
+
+      - type: grid
+        cards:
+          - type: heading
+            heading: Care and beans
+            icon: mdi:coffee-maker
+          - type: tile
+            entity: sensor.coffeejunkie_care_backflush
+            name: Backflush
+            state_content: text
+            tap_action:
+              action: perform-action
+              perform_action: script.coffeejunkie_backflush_done
+              confirmation:
+                text: Book the backflush as done now?
+            grid_options:
+              columns: full
+          - type: tile
+            entity: sensor.coffeejunkie_care_descale
+            name: Descale
+            state_content: text
+            tap_action:
+              action: perform-action
+              perform_action: script.coffeejunkie_descale_done
+              confirmation:
+                text: Book the descaling as done now?
+            grid_options:
+              columns: full
+          - type: tile
+            entity: sensor.coffeejunkie_care_grinder
+            name: Clean grinder
+            state_content: text
+            tap_action:
+              action: perform-action
+              perform_action: script.coffeejunkie_grinder_done
+              confirmation:
+                text: Book the grinder cleaning as done now?
+            grid_options:
+              columns: full
+          - type: tile
+            entity: sensor.coffeejunkie_beans_left
+            name: Beans left
+            state_content:
+              - state
+              - stock_g
+            tap_action:
+              action: perform-action
+              perform_action: script.coffeejunkie_new_bag
+              confirmation:
+                text: Opened a new bag? The stock goes back to the bag size.
+            grid_options:
+              columns: full
+          - type: markdown
+            content: Tap a line to book it as done or to start a new bag.
+            grid_options:
+              columns: full
+
+      - type: grid
+        cards:
+          - type: heading
+            heading: Live and calibration
+            icon: mdi:tune
+          - type: history-graph
+            title: Power, last 15 minutes
+            hours_to_show: 0.25
+            entities:
+              - entity: sensor.coffeejunkie_machine_power
+                name: Machine
+              - entity: sensor.coffeejunkie_grinder_power
+                name: Grinder
+            grid_options:
+              columns: full
+          - type: history-graph
+            title: Detection, last 15 minutes
+            hours_to_show: 0.25
+            entities:
+              - entity: binary_sensor.coffeejunkie_grinder_running
+                name: Grinder running
+              - entity: binary_sensor.coffeejunkie_pump_running
+                name: Pump running
+              - entity: binary_sensor.coffeejunkie_pump_activity
+                name: Pump activity
+              - entity: binary_sensor.coffeejunkie_portafilter_active
+                name: Portafilter active
+              - entity: binary_sensor.coffeejunkie_heating
+                name: Heating
+            grid_options:
+              columns: full
+
+      - type: grid
+        cards:
+          - type: heading
+            heading: Settings
+            icon: mdi:cog
+          - type: entities
+            title: General
+            entities:
+              - entity: input_select.coffeejunkie_mode
+                name: Mode
+              - entity: input_number.coffeejunkie_bag_g
+                name: Bag size
+              - entity: input_number.coffeejunkie_grams_per_brew
+                name: Grams per brew
+              - entity: input_number.coffeejunkie_stock_g
+                name: Bean stock
+            grid_options:
+              columns: full
+          - type: entities
+            title: Maintenance intervals (0 = off)
+            entities:
+              - entity: input_number.coffeejunkie_backflush_every_brews
+                name: Backflush every … brews
+              - entity: input_number.coffeejunkie_backflush_every_days
+                name: Backflush every … days
+              - entity: input_number.coffeejunkie_descale_every_brews
+                name: Descale every … brews
+              - entity: input_number.coffeejunkie_descale_every_days
+                name: Descale every … days
+              - entity: input_number.coffeejunkie_grinder_every_brews
+                name: Clean grinder every … brews
+              - entity: input_number.coffeejunkie_grinder_every_days
+                name: Clean grinder every … days
+            grid_options:
+              columns: full
+          - type: entities
+            title: Detection thresholds
+            state_color: false
+            entities:
+              - type: section
+                label: Grinder
+              - entity: input_number.coffeejunkie_grinder_on_w
+                name: Runs above
+              - entity: input_number.coffeejunkie_grinder_hold_s
+                name: Hold time
+              - entity: input_number.coffeejunkie_grinder_clean_s
+                name: Grind without brew = cleaning from
+              - type: section
+                label: Pump and brew
+              - entity: input_number.coffeejunkie_pump_min_w
+                name: Pump band from
+              - entity: input_number.coffeejunkie_pump_max_w
+                name: Pump band up to
+              - entity: input_number.coffeejunkie_pump_on_s
+                name: Pump in band for
+              - entity: input_number.coffeejunkie_pump_gap_s
+                name: Pump activity bridges gaps up to
+              - entity: input_number.coffeejunkie_pump_wait_s
+                name: Pump after grinder within
+              - entity: input_number.coffeejunkie_active_min_w
+                name: Portafilter active from
+              - entity: input_number.coffeejunkie_active_on_s
+                name: Portafilter active after
+              - entity: input_number.coffeejunkie_brew_min_s
+                name: Machine only, brew at least
+              - entity: input_number.coffeejunkie_brew_max_s
+                name: Machine only, brew at most
+              - type: section
+                label: Milk
+              - entity: input_number.coffeejunkie_heat_w
+                name: Heating above
+              - entity: input_number.coffeejunkie_heat_s
+                name: Heating lasts
+              - entity: input_number.coffeejunkie_milk_window_s
+                name: Milk within … after the brew
+              - type: section
+              - type: button
+                name: All settings back to the defaults
+                icon: mdi:restore
+                action_name: Reset
+                tap_action:
+                  action: perform-action
+                  perform_action: script.coffeejunkie_reset_settings
+                  confirmation:
+                    text: Set all thresholds, intervals, bag size and grams per brew back to the defaults? Counters stay.
+            grid_options:
+              columns: full
